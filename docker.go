@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"net"
 	"net/netip"
+	"time"
 
-	docker "github.com/fsouza/go-dockerclient"
+	"github.com/containers/podman/v5/pkg/bindings"
+	"github.com/containers/podman/v5/pkg/bindings/network"
 	"go.uber.org/zap"
 	"go4.org/netipx"
 )
@@ -11,75 +16,64 @@ import (
 var (
 	dockerLogger    = logger.Named("Docker")
 	dockerNetworks  []string
-	dockerClient    *docker.Client
+	dockerClient    context.Context
 	dockerNetIPSets = map[string]*netipx.IPSet{}
 	dockerActiveIPs = &netipx.IPSet{}
 	dockerNewIP     = make(chan netip.Addr, 64)
+	ctMap           = make(map[string]struct{})
 )
 
 func dockerListen() (e error) {
-	if dockerClient, e = docker.NewClientFromEnv(); e != nil {
+	dockerClient, e = bindings.NewConnection(context.Background(), "unix:///run/podman/podman.sock")
+	if e != nil {
 		return e
 	}
-	events := make(chan *docker.APIEvents, 64)
-	if e = dockerClient.AddEventListenerWithOptions(docker.EventsOptions{
-		Filters: map[string][]string{
-			"type":    {"network"},
-			"event":   {"connect", "disconnect"},
-			"network": dockerNetworks,
-		},
-	}, events); e != nil {
-		return e
-	}
-
-	for _, network := range dockerNetworks {
-		dockerRefreshNetwork(network, func(string) bool { return true })
-	}
-
 	go func() {
-		for evt := range events {
-			ctID := evt.Actor.Attributes["container"]
-			dockerRefreshNetwork(evt.Actor.Attributes["name"],
-				func(ct string) bool { return ct == ctID })
+		for {
+			for _, n := range dockerNetworks {
+				dockerRefreshNetwork(n)
+			}
+			time.Sleep(30 * time.Second)
 		}
 	}()
 
 	return nil
 }
 
-func dockerRefreshNetwork(name string, isNewContainer func(ctID string) bool) {
-	network, e := dockerClient.NetworkInfo(name)
+func dockerRefreshNetwork(name string) {
+	inspect, e := network.Inspect(dockerClient, name, nil)
 	if e != nil {
-		dockerLogger.Warn("NetworkInfo error", zap.Error(e))
+		dockerLogger.Warn("NetworkInfo error "+name, zap.Error(e))
 		return
 	}
 
 	var b netipx.IPSetBuilder
 	var ipAddrs []string
 	var newIPs []netip.Addr
-	for ctID, ct := range network.Containers {
-		prefix, _ := netip.ParsePrefix(ct.IPv6Address)
-		ip := prefix.Addr()
-		b.Add(ip)
-		ipAddrs = append(ipAddrs, ip.String())
-
-		if isNewContainer(ctID) {
-			newIPs = append(newIPs, ip)
+	for ctID, ct := range inspect.Containers {
+		for _, iface := range ct.Interfaces {
+			for _, subnet := range iface.Subnets {
+				if subnet.IPNet.IP.IsGlobalUnicast() && len(subnet.IPNet.IP) == net.IPv6len {
+					fmt.Println(subnet.IPNet.IP.String())
+					ip := netip.AddrFrom16([16]byte(subnet.IPNet.IP.To16()))
+					b.Add(ip)
+					ipAddrs = append(ipAddrs, ip.String())
+					if _, ok := ctMap[ctID]; !ok {
+						newIPs = append(newIPs, ip)
+						ctMap[ctID] = struct{}{}
+					}
+				}
+			}
 		}
 	}
-	dockerLogger.Info("active IPs updated",
-		zap.String("network", network.Name),
-		zap.Strings("ip", ipAddrs),
-	)
-	dockerNetIPSets[network.ID], _ = b.IPSet()
-
-	for net, ipset := range dockerNetIPSets {
-		if net != network.ID {
-			b.AddSet(ipset)
+	dockerLogger.Info("active IPs updated", zap.String("network", inspect.Name), zap.Strings("ip", ipAddrs))
+	dockerNetIPSets[inspect.ID], _ = b.IPSet()
+	for n, inset := range dockerNetIPSets {
+		if n != inspect.ID {
+			b.AddSet(inset)
 		}
 	}
 	dockerActiveIPs, _ = b.IPSet()
-
 	for _, ip := range newIPs {
 		dockerNewIP <- ip
 	}

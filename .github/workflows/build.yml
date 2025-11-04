@@ -1,23 +1,40 @@
----
 name: build
 on:
   push:
-  pull_request:
+    tags:
+      - 'v*'
   workflow_dispatch:
-permissions: {}
+permissions:
+  contents: write
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ubuntu-latest
     env:
       CGO_ENABLED: 0
+      GOARCH: ${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go build .
-  docker:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/build-push-action@v5
+
+      - name: Build binary
+        run: go build -o myapp-linux-${{ matrix.arch }} .
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: myapp-linux-${{ matrix.arch }}
+          path: myapp-linux-${{ matrix.arch }}
+          retention-days: 7
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: myapp-linux-${{ matrix.arch }}
+          generate_release_notes: true
