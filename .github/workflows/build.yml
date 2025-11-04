@@ -22,8 +22,17 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build binary
-        run: go build -tags containers_image_openpgp -o myapp-linux-${{ matrix.arch }} .
+      - name: Build binary (optimized)
+        run: |
+          go build \
+            -tags "containers_image_openpgp" \
+            -ldflags="-s -w" \
+            -trimpath \
+            -o myapp-linux-${{ matrix.arch }} .
+
+      - name: Strip binary (optional)
+        run: |
+          strip myapp-linux-${{ matrix.arch }} || true
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
